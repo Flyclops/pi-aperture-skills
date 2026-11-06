@@ -1,0 +1,27 @@
+{
+  "name": "pi-aperture-skills",
+  "version": "0.1.0",
+  "description": "Load the skills Aperture publishes over MCP into pi as /skill:<name> commands.",
+  "type": "module",
+  "private": true,
+  "keywords": [
+    "pi-package"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "node --test 'test/**/*.test.ts'",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.5.0",
+    "@types/node": "^26.0.0",
+    "typescript": "^7.0.0"
+  }
+}
