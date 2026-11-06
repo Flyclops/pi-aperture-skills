@@ -13,3 +13,21 @@ This repo is a pi extension. Before you change extension code, read:
 
 You're done with this step when you can name the API surface your change
 touches and the doc section that defines it.
+
+## Agent skills
+
+### Issue tracker
+
+Issues live as local markdown files under `.scratch/<feature>/`.
+See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default five-role vocabulary (`needs-triage`, `needs-info`,
+`ready-for-agent`, `ready-for-human`, `wontfix`).
+See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: root `GLOSSARY.md` + `docs/adr/`.
+See `docs/agents/domain.md`.
