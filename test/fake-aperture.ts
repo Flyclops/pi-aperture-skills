@@ -16,7 +16,7 @@ export interface FakeSkill {
 
 export interface FakeAperture {
 	url: string;
-	/** Methods received, in order. */
+	/** Methods received, in order; a session close is recorded as "DELETE". */
 	calls: string[];
 	/** Whether the session was closed with DELETE. */
 	closed: boolean;
@@ -37,6 +37,14 @@ export interface FakeOptions {
 	hangDelete?: boolean;
 	/** Raw entries appended to the `skills/list` result, e.g. malformed ones. */
 	rawListing?: unknown[];
+	/** Keep every SSE response open after sending the reply. */
+	keepOpen?: boolean;
+	/** Per-URI delay, in ms, before answering `resources/read`. */
+	readDelayMs?: Record<string, number>;
+	/** Send each SSE response in pieces of this many bytes. */
+	chunkBytes?: number;
+	/** Leave each skill's SKILL.md out of its listed `resources`. */
+	omitMainResource?: boolean;
 }
 
 const SESSION = "test-session";
@@ -51,6 +59,7 @@ export async function startFakeAperture(opts: FakeOptions): Promise<FakeAperture
 	const handle = async (req: IncomingMessage, res: ServerResponse) => {
 		if (opts.delayMs) await new Promise((r) => setTimeout(r, opts.delayMs));
 		if (req.method === "DELETE") {
+			state.calls.push("DELETE");
 			if (opts.hangDelete) return;
 			state.closed = true;
 			res.writeHead(204).end();
@@ -71,7 +80,10 @@ export async function startFakeAperture(opts: FakeOptions): Promise<FakeAperture
 		}
 		const reply = (payload: object, headers: Record<string, string> = {}) => {
 			res.writeHead(200, { "content-type": "text/event-stream", ...headers });
-			res.end(`event: message\ndata: ${JSON.stringify({ jsonrpc: "2.0", id: msg.id, ...payload })}\n\n`);
+			const event = `event: message\ndata: ${JSON.stringify({ jsonrpc: "2.0", id: msg.id, ...payload })}\n\n`;
+			const step = opts.chunkBytes ?? event.length;
+			for (let i = 0; i < event.length; i += step) res.write(event.slice(i, i + step));
+			if (!opts.keepOpen) res.end();
 		};
 
 		switch (msg.method) {
@@ -92,7 +104,9 @@ export async function startFakeAperture(opts: FakeOptions): Promise<FakeAperture
 						skills: [...(start === 0 ? (opts.rawListing ?? []) : []), ...page.map((s) => ({
 							uri: s.uri,
 							frontmatter: { name: s.name, description: `${s.name} skill` },
-							resources: Object.entries(s.files).map(([uri, text]) => ({
+							resources: Object.entries(s.files)
+								.filter(([uri]) => !(opts.omitMainResource && uri === s.uri))
+								.map(([uri, text]) => ({
 								uri,
 								size: text.length,
 							})),
@@ -103,6 +117,11 @@ export async function startFakeAperture(opts: FakeOptions): Promise<FakeAperture
 			}
 			case "resources/read": {
 				const uri = msg.params.uri as string;
+				const wait = opts.readDelayMs?.[uri];
+				if (wait) {
+					await new Promise((r) => setTimeout(r, wait));
+					state.calls.push(`read-done ${uri}`);
+				}
 				const text = opts.skills.map((s) => s.files[uri]).find((t) => t !== undefined);
 				if (text === undefined || opts.failReads?.includes(uri)) {
 					return reply({ error: { code: -32602, message: "Resource not found" } });

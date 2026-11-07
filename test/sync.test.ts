@@ -202,3 +202,170 @@ test("keeps credentials and query strings out of error messages", async () => {
 		(err: Error) => !err.message.includes("secret") && /127\.0\.0\.1:1\/v1\/mcp/.test(err.message),
 	);
 });
+
+test("keeps URL credentials out of fetch's own error messages", async () => {
+	await assert.rejects(
+		syncSkills({ url: "http://user:hunter2@127.0.0.1:1/v1/mcp?token=secret", cacheDir: freshDir() }),
+		(err: Error) => !/hunter2|secret|user:/.test(err.message),
+	);
+});
+
+test("answers from an SSE stream the server keeps open", async (t) => {
+	const fake = await startFakeAperture({ skills: [skill("personal", "a")], keepOpen: true });
+	t.after(() => fake.close());
+
+	const result = await syncSkills({ url: fake.url, cacheDir: freshDir(), signal: AbortSignal.timeout(2000) });
+
+	assert.deepEqual(result.loaded, ["a"]);
+});
+
+test("skips skills once the total download budget is spent", async (t) => {
+	const fake = await startFakeAperture({
+		skills: [skill("personal", "a", { "big.txt": "x".repeat(600) }), skill("personal", "b", { "big.txt": "x".repeat(600) })],
+	});
+	t.after(() => fake.close());
+
+	const result = await syncSkills({ url: fake.url, cacheDir: freshDir(), maxTotalBytes: 1000, concurrency: 1 });
+
+	assert.equal(result.loaded.length, 1);
+	assert.match(result.skipped[0]!.reason, /1000-byte download budget/);
+});
+
+test("refuses a skill URI that would make a whole group its directory", async (t) => {
+	const groupWide: FakeSkill = {
+		uri: "skill://personal/SKILL.md",
+		name: "wide",
+		files: {
+			"skill://personal/SKILL.md": "---\nname: wide\ndescription: w\n---\n",
+			"skill://personal/victim/%53KILL.md": "hijacked",
+		},
+	};
+	const fake = await startFakeAperture({ skills: [groupWide, skill("personal", "victim")] });
+	t.after(() => fake.close());
+	const dir = freshDir();
+
+	const result = await syncSkills({ url: fake.url, cacheDir: dir });
+
+	assert.deepEqual(result.loaded, ["victim"]);
+	assert.match(result.skipped[0]!.reason, /unsafe skill URI/);
+	assert.match(readFileSync(join(dir, "personal", "victim", "SKILL.md"), "utf8"), /name: victim/);
+});
+
+test("refuses skills whose directories overlap", async (t) => {
+	const fake = await startFakeAperture({
+		skills: [skill("personal", "outer"), skill("personal", "outer/inner"), skill("personal", "fine")],
+	});
+	t.after(() => fake.close());
+
+	const result = await syncSkills({ url: fake.url, cacheDir: freshDir() });
+
+	assert.deepEqual(result.loaded, ["fine"]);
+	assert.deepEqual(result.skipped.map((s) => s.reason), ["overlaps another skill's directory", "overlaps another skill's directory"]);
+});
+
+test("fails the sync, rather than skipping skills, when it times out mid-read", async (t) => {
+	const slow = skill("personal", "slow");
+	const fake = await startFakeAperture({ skills: [skill("personal", "fast"), slow], readDelayMs: { [slow.uri]: 1000 } });
+	t.after(() => fake.close());
+
+	await assert.rejects(
+		syncSkills({ url: fake.url, cacheDir: freshDir(), signal: AbortSignal.timeout(300) }),
+		{ name: "TimeoutError" },
+	);
+});
+
+test("skips a skill that can't be written and keeps the others", async (t) => {
+	const clash = skill("personal", "clash", { "extra.md": "file", "extra.md/nested.txt": "under a file" });
+	const fake = await startFakeAperture({ skills: [clash, skill("personal", "ok")] });
+	t.after(() => fake.close());
+	const dir = freshDir();
+
+	const result = await syncSkills({ url: fake.url, cacheDir: dir });
+
+	assert.deepEqual(result.loaded, ["ok"]);
+	assert.match(result.skipped[0]!.reason, /^could not write/);
+	assert.ok(!existsSync(join(dir, "personal", "clash")), "no half-written skill is left");
+});
+
+test("downloads SKILL.md even when resources leave it out", async (t) => {
+	const fake = await startFakeAperture({ skills: [skill("personal", "a", { "notes.md": "n" })], omitMainResource: true });
+	t.after(() => fake.close());
+	const dir = freshDir();
+
+	const result = await syncSkills({ url: fake.url, cacheDir: dir });
+
+	assert.deepEqual(result.loaded, ["a"]);
+	assert.ok(existsSync(join(dir, "personal", "a", "SKILL.md")));
+	assert.ok(existsSync(join(dir, "personal", "a", "notes.md")));
+});
+
+test("lets a failed skill's other reads finish before closing the session", async (t) => {
+	const s = skill("personal", "a", { "slow.md": "s" });
+	const fake = await startFakeAperture({
+		skills: [s],
+		failReads: [s.uri],
+		readDelayMs: { "skill://personal/a/slow.md": 200 },
+	});
+	t.after(() => fake.close());
+
+	await syncSkills({ url: fake.url, cacheDir: freshDir() });
+
+	// Snapshot as soon as the sync returns: by then every read must have
+	// been answered and the session closed, in that order.
+	const calls = [...fake.calls];
+	assert.deepEqual(calls.slice(-2), ["read-done skill://personal/a/slow.md", "DELETE"]);
+});
+
+test("parses SSE replies that arrive in tiny chunks", async (t) => {
+	const fake = await startFakeAperture({ skills: [skill("personal", "a", { "notes.md": "n\r\n\r\nm" })], chunkBytes: 1 });
+	t.after(() => fake.close());
+	const dir = freshDir();
+
+	const result = await syncSkills({ url: fake.url, cacheDir: dir });
+
+	assert.deepEqual(result.loaded, ["a"]);
+	assert.equal(readFileSync(join(dir, "personal", "a", "notes.md"), "utf8"), "n\r\n\r\nm");
+});
+
+test("catches nesting hidden by a sibling that sorts between", async (t) => {
+	const fake = await startFakeAperture({
+		skills: [skill("personal", "a"), skill("personal", "a-b"), skill("personal", "a/x")],
+	});
+	t.after(() => fake.close());
+
+	const result = await syncSkills({ url: fake.url, cacheDir: freshDir() });
+
+	assert.deepEqual(result.loaded, ["a-b"]);
+	assert.deepEqual(result.skipped.map((s) => s.name).sort(), ["a", "a/x"]);
+});
+
+test("treats directories differing only in case or Unicode form as the same", async (t) => {
+	const fake = await startFakeAperture({
+		skills: [
+			skill("personal", "tdd"),
+			skill("personal", "TDD"),
+			skill("personal", "caf%C3%A9"),
+			skill("personal", "cafe%CC%81"),
+			skill("personal", "%C5%BFkill"),
+			skill("personal", "skill"),
+			skill("personal", "fine"),
+		],
+	});
+	t.after(() => fake.close());
+
+	const result = await syncSkills({ url: fake.url, cacheDir: freshDir() });
+
+	assert.deepEqual(result.loaded, ["fine"]);
+	assert.equal(result.skipped.length, 6);
+});
+
+test("stops downloading once the budget is spent", async (t) => {
+	const files = Object.fromEntries(Array.from({ length: 10 }, (_, i) => [`f${i}.txt`, "x".repeat(600)]));
+	const fake = await startFakeAperture({ skills: [skill("personal", "a", files)] });
+	t.after(() => fake.close());
+
+	await syncSkills({ url: fake.url, cacheDir: freshDir(), maxTotalBytes: 1000, concurrency: 1 });
+
+	// SKILL.md, f0 and f1 use up 1000 bytes; nothing after that is fetched.
+	assert.equal(fake.calls.filter((c) => c === "resources/read").length, 3);
+});

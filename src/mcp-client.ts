@@ -60,8 +60,11 @@ export async function openSession(url: string, signal?: AbortSignal): Promise<Mc
 			res = await fetch(url, { method: "POST", headers, body: JSON.stringify(message), signal });
 		} catch (err) {
 			if (signal?.aborted) throw signal.reason;
+			// fetch's own messages can quote the full URL, credentials and
+			// all, so scrub it before the text reaches the user.
 			const cause = (err as { cause?: { message?: string } }).cause?.message;
-			throw new Error(`could not reach Aperture at ${shown}: ${cause ?? (err as Error).message}`);
+			const detail = (cause ?? (err as Error).message).split(url).join(shown);
+			throw new Error(`could not reach Aperture at ${shown}: ${detail}`);
 		}
 		if (!res.ok && res.status !== 202) {
 			throw new Error(`Aperture at ${shown} answered HTTP ${res.status}`);
@@ -109,40 +112,54 @@ interface JsonRpcReply {
 	error?: { code: number; message: string };
 }
 
-/** Reads the reply to request `id` from a JSON or SSE response body. */
+/**
+ * Reads the reply to request `id` from a JSON or SSE response body, never
+ * buffering more than `MAX_BODY_BYTES`. SSE events are parsed as they arrive
+ * and reading stops at the matching reply, so a server that keeps the stream
+ * open after answering doesn't stall us.
+ */
 async function readReply(res: Response, id: number): Promise<JsonRpcReply> {
-	const body = await readCapped(res);
-	const type = res.headers.get("content-type") ?? "";
-	const messages: JsonRpcReply[] = type.includes("text/event-stream")
-		? body
-				.split(/\r?\n\r?\n/)
-				.map((event) =>
-					event
-						.split(/\r?\n/)
-						.filter((line) => line.startsWith("data:"))
-						.map((line) => line.slice(5).trimStart())
-						.join("\n"),
-				)
-				.filter((data) => data !== "")
-				.map((data) => JSON.parse(data) as JsonRpcReply)
-		: [JSON.parse(body) as JsonRpcReply];
-	const reply = messages.find((m) => m.id === id);
-	if (!reply) throw new Error(`Aperture sent no reply to request ${id}`);
+	const tooBig = () => new Error(`Aperture sent a response over ${MAX_BODY_BYTES} bytes`);
+	if (Number(res.headers.get("content-length") ?? 0) > MAX_BODY_BYTES) throw tooBig();
+	const sse = (res.headers.get("content-type") ?? "").includes("text/event-stream");
+	const decoder = new TextDecoder();
+	let size = 0;
+	// Pending text is kept as pieces and joined only once an event is
+	// complete. Each new piece is searched together with the last 3 chars
+	// before it (a `\r\n\r\n` can straddle chunks), so a large event costs
+	// O(size) overall rather than O(size × chunks).
+	let pending: string[] = [];
+	let tail = "";
+	const boundary = /\r?\n\r?\n/;
+	// Throwing or returning out of `for await` cancels the stream.
+	for await (const chunk of res.body ?? []) {
+		size += chunk.byteLength;
+		if (size > MAX_BODY_BYTES) throw tooBig();
+		const text = decoder.decode(chunk, { stream: true });
+		pending.push(text);
+		const window = tail + text;
+		tail = window.slice(-3);
+		if (!sse || !boundary.test(window)) continue;
+		const events = pending.join("").split(/\r?\n\r?\n/);
+		const rest = events.pop()!; // the last piece may be incomplete
+		const reply = events.map(parseEvent).find((m) => m?.id === id);
+		if (reply) return reply;
+		pending = [rest];
+		tail = rest.slice(-3);
+	}
+	let buffer = pending.join("");
+	buffer += decoder.decode();
+	const reply = sse ? parseEvent(buffer) : (JSON.parse(buffer) as JsonRpcReply);
+	if (reply?.id !== id) throw new Error(`Aperture sent no reply to request ${id}`);
 	return reply;
 }
 
-/** Reads the body as text, failing once it passes `MAX_BODY_BYTES`. */
-async function readCapped(res: Response): Promise<string> {
-	const tooBig = () => new Error(`Aperture sent a response over ${MAX_BODY_BYTES} bytes`);
-	if (Number(res.headers.get("content-length") ?? 0) > MAX_BODY_BYTES) throw tooBig();
-	if (!res.body) return "";
-	const chunks: Uint8Array[] = [];
-	let size = 0;
-	for await (const chunk of res.body) {
-		size += chunk.byteLength;
-		// Throwing out of `for await` cancels the stream.
-		if (size > MAX_BODY_BYTES) throw tooBig();
-		chunks.push(chunk);
-	}
-	return Buffer.concat(chunks).toString("utf8");
+/** Parses one SSE event's joined `data:` lines; undefined if it has none. */
+function parseEvent(event: string): JsonRpcReply | undefined {
+	const data = event
+		.split(/\r?\n/)
+		.filter((line) => line.startsWith("data:"))
+		.map((line) => line.slice(5).trimStart())
+		.join("\n");
+	return data ? (JSON.parse(data) as JsonRpcReply) : undefined;
 }

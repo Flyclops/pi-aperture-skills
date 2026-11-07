@@ -35,7 +35,10 @@ pi install /path/to/pi-aperture-skills
   Aperture skills, personal beats org. Pi warns about every collision.
 - **Failures:** if Aperture doesn't answer within 5 seconds, or the URL is
   missing, pi starts without Aperture skills and the notice says why. A skill
-  with an unreadable or unsafe file is skipped and named in the notice.
+  that can't be fully read or written, has an unsafe path, or shares a directory
+  with another skill is skipped and named in the notice.
+- **Limits:** 10 MB per response and 100 MB of skill files per sync; skills past
+  the total limit are skipped.
 - **Not included:** Aperture's built-in skills and search-only upstream skills.
   See [docs/adr/0002](docs/adr/0002-published-skills-only.md).
 

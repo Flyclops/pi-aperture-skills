@@ -3,11 +3,11 @@
  *
  * One call does the whole job: open an MCP session, page through
  * `skills/list`, read every file with `resources/read`, and mirror each file's
- * `skill://` URI under `cacheDir`. A skill is written only once all its files
- * are read and every path is safe, so pi never sees half a skill.
+ * `skill://` URI under `cacheDir`. Each skill is confined to its own
+ * directory and written only once all its files are read.
  */
-import { mkdirSync, writeFileSync } from "node:fs";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { openSession } from "./mcp-client.ts";
 
 export interface SyncOptions {
@@ -18,6 +18,8 @@ export interface SyncOptions {
 	signal?: AbortSignal;
 	/** Maximum parallel `resources/read` calls. */
 	concurrency?: number;
+	/** Most file data to download in total (default `MAX_TOTAL_BYTES`). */
+	maxTotalBytes?: number;
 }
 
 export interface SyncResult {
@@ -43,15 +45,33 @@ interface ReadResult {
 /** Groups pi should search first; any others follow alphabetically. */
 const PRIORITY = ["personal", "org"];
 
+/** Most file data one sync may download, across all skills. */
+export const MAX_TOTAL_BYTES = 100 * 1024 * 1024;
+
 export async function syncSkills(opts: SyncOptions): Promise<SyncResult> {
 	const session = await openSession(opts.url, opts.signal);
 	try {
-		const skills = await listAllSkills(session.request);
+		const plans = claimDirs((await listAllSkills(session.request)).map((s) => planSkill(s, opts.cacheDir)));
 		// One limit across every file of every skill, so a skill with
 		// thousands of resources can't fire thousands of requests at once.
 		const limited = limiter(opts.concurrency ?? 8);
-		const read: Request = (method, params) => limited(() => session.request(method, params));
-		const outcomes = await Promise.all(skills.map((s) => fetchSkill(s, opts.cacheDir, read)));
+		const total = opts.maxTotalBytes ?? MAX_TOTAL_BYTES;
+		let left = total;
+		// The whole read, budget check to budget update, runs inside one
+		// slot, so nothing is downloaded after the budget runs out.
+		const readFile = (uri: string) =>
+			limited(async () => {
+				if (left <= 0) throw overBudget(total);
+				const data = decodeContents(await session.request<ReadResult>("resources/read", { uri }), uri);
+				left -= data.byteLength;
+				if (left < 0) throw overBudget(total);
+				return data;
+			});
+		const outcomes = await Promise.all(
+			plans.map((plan) => ("reason" in plan ? plan : fetchSkill(plan, readFile, opts.signal))),
+		);
+		// A timeout must fail the sync, not show up as a few skipped skills.
+		opts.signal?.throwIfAborted();
 
 		const result: SyncResult = { skillPaths: [], loaded: [], skipped: [] };
 		const groups = new Set<string>();
@@ -59,10 +79,6 @@ export async function syncSkills(opts: SyncOptions): Promise<SyncResult> {
 			if ("reason" in outcome) {
 				result.skipped.push(outcome);
 				continue;
-			}
-			for (const file of outcome.files) {
-				mkdirSync(dirname(file.path), { recursive: true });
-				writeFileSync(file.path, file.data);
 			}
 			result.loaded.push(outcome.name);
 			groups.add(outcome.group);
@@ -73,6 +89,16 @@ export async function syncSkills(opts: SyncOptions): Promise<SyncResult> {
 		await session.close();
 	}
 }
+
+/** The file's bytes from a `resources/read` result. */
+function decodeContents(res: ReadResult, uri: string): Buffer {
+	const c = Array.isArray(res?.contents) ? res.contents[0] : undefined;
+	if (typeof c?.blob === "string") return Buffer.from(c.blob, "base64");
+	if (typeof c?.text === "string") return Buffer.from(c.text, "utf8");
+	throw new Error(`resources/read returned no content for ${uri}`);
+}
+
+const overBudget = (total: number) => new Error(`skills exceed the ${total}-byte download budget`);
 
 type Request = <T>(method: string, params?: object) => Promise<T>;
 
@@ -91,15 +117,14 @@ async function listAllSkills(request: Request): Promise<unknown[]> {
 	return all;
 }
 
-type Fetched =
-	| { name: string; group: string; files: { path: string; data: Buffer }[] }
-	| { name: string; reason: string };
+type Skipped = { name: string; reason: string };
+type Plan = { name: string; group: string; dir: string; files: { uri: string; path: string }[] };
 
 /**
- * Reads one skill's files into memory. Never throws: anything wrong with the
- * skill, including a malformed listing entry, becomes a `reason`.
+ * Validates one listing entry and works out where its files go. Never
+ * throws: anything wrong with the entry becomes a `reason`.
  */
-async function fetchSkill(raw: unknown, cacheDir: string, request: Request): Promise<Fetched> {
+function planSkill(raw: unknown, cacheDir: string): Plan | Skipped {
 	const skill = raw as ListedSkill;
 	const name =
 		typeof skill?.frontmatter?.name === "string"
@@ -107,38 +132,94 @@ async function fetchSkill(raw: unknown, cacheDir: string, request: Request): Pro
 			: typeof skill?.uri === "string"
 				? skill.uri
 				: "(unnamed)";
-	try {
-		if (typeof skill?.uri !== "string") throw new Error("listing entry has no uri");
-		const resources = skill.resources ?? [];
-		if (!Array.isArray(resources)) throw new Error("listing entry has malformed resources");
-		const uris = resources.length ? resources.map((r) => r?.uri) : [skill.uri];
+	const skip = (reason: string) => ({ name, reason });
+	if (typeof skill?.uri !== "string") return skip("listing entry has no uri");
+	const resources = skill.resources ?? [];
+	if (!Array.isArray(resources)) return skip("listing entry has malformed resources");
 
-		// Every file must sit in the skill's own directory, so one skill
-		// can't overwrite another.
-		const skillDir = cachePathFor(skill.uri, cacheDir);
-		const paths: string[] = [];
-		for (const uri of uris) {
-			const path = typeof uri === "string" ? cachePathFor(uri, cacheDir) : undefined;
-			if (!skillDir || !path || !path.startsWith(dirname(skillDir) + sep)) {
-				return { name, reason: `unsafe file URI ${JSON.stringify(uri)}` };
-			}
-			paths.push(path);
-		}
-
-		const files = await Promise.all(
-			(uris as string[]).map(async (uri, i) => {
-				const res = await request<ReadResult>("resources/read", { uri });
-				const c = Array.isArray(res?.contents) ? res.contents[0] : undefined;
-				if (typeof c?.blob === "string") return { path: paths[i]!, data: Buffer.from(c.blob, "base64") };
-				if (typeof c?.text === "string") return { path: paths[i]!, data: Buffer.from(c.text, "utf8") };
-				throw new Error(`resources/read returned no content for ${uri}`);
-			}),
-		);
-		const group = relative(cacheDir, paths[0]!).split(sep)[0]!;
-		return { name, group, files };
-	} catch (err) {
-		return { name, reason: (err as Error).message };
+	// The skill's directory is the parent of its SKILL.md, and must sit
+	// below a group (`<group>/<name>/SKILL.md`), never be the group itself.
+	const main = cachePathFor(skill.uri, cacheDir);
+	if (!main || basename(main) !== "SKILL.md" || relative(cacheDir, main).split(sep).length < 3) {
+		return skip(`unsafe skill URI ${JSON.stringify(skill.uri)}`);
 	}
+	const dir = dirname(main);
+
+	// SKILL.md always comes first, whether or not `resources` lists it.
+	const uris = [...new Set([skill.uri, ...resources.map((r) => r?.uri)])];
+	const files: Plan["files"] = [];
+	for (const uri of uris) {
+		const path = typeof uri === "string" ? cachePathFor(uri, cacheDir) : undefined;
+		if (!path || !path.startsWith(dir + sep)) return skip(`unsafe file URI ${JSON.stringify(uri)}`);
+		files.push({ uri: uri as string, path });
+	}
+	const group = relative(cacheDir, dir).split(sep)[0]!;
+	return { name, group, dir, files };
+}
+
+/**
+ * Skips every skill whose directory equals, contains or sits inside
+ * another's, so no skill can overwrite another's files.
+ *
+ * Directories are compared by `claimKey`, which folds case (upper then lower,
+ * so pairs like `ſ`/`s` and `µ`/`μ` match), Unicode form and
+ * trailing dots/spaces the way macOS and Windows filesystems do, and ends in a
+ * separator so `a/` is never mistaken for a prefix of `a-b/`. After sorting,
+ * every directory nested in another comes after it, so one pass with a stack
+ * of enclosing directories finds every overlap: O(n log n).
+ */
+function claimDirs(plans: (Plan | Skipped)[]): (Plan | Skipped)[] {
+	const keyed = plans
+		.filter((p): p is Plan => "dir" in p)
+		.map((plan) => ({ plan, key: claimKey(plan.dir) }))
+		.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+	const clash = new Set<Plan>();
+	const enclosing: (typeof keyed)[number][] = [];
+	for (const cur of keyed) {
+		while (enclosing.length && !cur.key.startsWith(enclosing.at(-1)!.key)) enclosing.pop();
+		const outer = enclosing.at(-1);
+		if (outer) clash.add(outer.plan).add(cur.plan);
+		enclosing.push(cur);
+	}
+	return plans.map((p) => ("dir" in p && clash.has(p) ? { name: p.name, reason: "overlaps another skill's directory" } : p));
+}
+
+/** A directory's identity on a case- and normalization-insensitive filesystem. */
+function claimKey(dir: string): string {
+	const folded = dir
+		.split(sep)
+		.map((s) => s.normalize("NFC").toUpperCase().toLowerCase().replace(/[. ]+$/, ""))
+		.join(sep);
+	return folded + sep;
+}
+
+/**
+ * Downloads one skill and writes it to disk. A skill is written only once all
+ * its files are read, and a failed write removes what was written, so pi
+ * never sees half a skill. Never throws, except to propagate an abort.
+ */
+async function fetchSkill(
+	plan: Plan,
+	readFile: (uri: string) => Promise<Buffer>,
+	signal?: AbortSignal,
+): Promise<{ name: string; group: string } | Skipped> {
+	// allSettled, not all: every read of this skill finishes before we
+	// return, so none is still running when the session closes.
+	const reads = await Promise.allSettled(plan.files.map(({ uri }) => readFile(uri)));
+	signal?.throwIfAborted();
+	const failed = reads.find((r) => r.status === "rejected");
+	if (failed) return { name: plan.name, reason: (failed.reason as Error).message };
+
+	try {
+		plan.files.forEach(({ path }, i) => {
+			mkdirSync(dirname(path), { recursive: true });
+			writeFileSync(path, (reads[i] as PromiseFulfilledResult<Buffer>).value);
+		});
+	} catch (err) {
+		rmSync(plan.dir, { recursive: true, force: true });
+		return { name: plan.name, reason: `could not write: ${(err as Error).message}` };
+	}
+	return { name: plan.name, group: plan.group };
 }
 
 /**
