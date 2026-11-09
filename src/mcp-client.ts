@@ -20,9 +20,23 @@ export class McpError extends Error {
 	}
 }
 
+/** A response body was bigger than the caller allowed. */
+export class ResponseTooLargeError extends Error {
+	readonly limit: number;
+
+	constructor(limit: number) {
+		super(`Aperture sent a response over ${limit} bytes`);
+		this.name = "ResponseTooLargeError";
+		this.limit = limit;
+	}
+}
+
 export interface McpSession {
-	/** Sends a request and resolves with its `result`. */
-	request<T>(method: string, params?: object): Promise<T>;
+	/**
+	 * Sends a request and resolves with its `result`. The response body may
+	 * be at most `maxBytes` (default and ceiling: `MAX_BODY_BYTES`).
+	 */
+	request<T>(method: string, params?: object, maxBytes?: number): Promise<T>;
 	/** Ends the session. Best effort: the server expires idle sessions anyway. */
 	close(): Promise<void>;
 }
@@ -67,17 +81,19 @@ export async function openSession(url: string, signal?: AbortSignal): Promise<Mc
 			throw new Error(`could not reach Aperture at ${shown}: ${detail}`);
 		}
 		if (!res.ok && res.status !== 202) {
+			// An unread body keeps its connection busy; release it.
+			await discard(res);
 			throw new Error(`Aperture at ${shown} answered HTTP ${res.status}`);
 		}
 		return res;
 	};
 
-	const request = async <T>(method: string, params: object = {}): Promise<T> => {
+	const request = async <T>(method: string, params: object = {}, maxBytes = MAX_BODY_BYTES): Promise<T> => {
 		const id = nextId++;
 		const res = await post({ jsonrpc: "2.0", id, method, params });
 		const sid = res.headers.get("mcp-session-id");
 		if (sid) sessionId = sid;
-		const reply = await readReply(res, id);
+		const reply = await readReply(res, id, Math.min(maxBytes, MAX_BODY_BYTES));
 		if (reply.error) throw new McpError(method, reply.error.code, reply.error.message);
 		return reply.result as T;
 	};
@@ -87,7 +103,7 @@ export async function openSession(url: string, signal?: AbortSignal): Promise<Mc
 		capabilities: {},
 		clientInfo: { name: "pi-aperture-skills", version: "0.1.0" },
 	});
-	await post({ jsonrpc: "2.0", method: "notifications/initialized" });
+	await discard(await post({ jsonrpc: "2.0", method: "notifications/initialized" }));
 
 	return {
 		request,
@@ -114,13 +130,15 @@ interface JsonRpcReply {
 
 /**
  * Reads the reply to request `id` from a JSON or SSE response body, never
- * buffering more than `MAX_BODY_BYTES`. SSE events are parsed as they arrive
+ * buffering more than `maxBytes`. SSE events are parsed as they arrive
  * and reading stops at the matching reply, so a server that keeps the stream
  * open after answering doesn't stall us.
  */
-async function readReply(res: Response, id: number): Promise<JsonRpcReply> {
-	const tooBig = () => new Error(`Aperture sent a response over ${MAX_BODY_BYTES} bytes`);
-	if (Number(res.headers.get("content-length") ?? 0) > MAX_BODY_BYTES) throw tooBig();
+async function readReply(res: Response, id: number, maxBytes: number): Promise<JsonRpcReply> {
+	if (Number(res.headers.get("content-length") ?? 0) > maxBytes) {
+		await discard(res);
+		throw new ResponseTooLargeError(maxBytes);
+	}
 	const sse = (res.headers.get("content-type") ?? "").includes("text/event-stream");
 	const decoder = new TextDecoder();
 	let size = 0;
@@ -134,7 +152,7 @@ async function readReply(res: Response, id: number): Promise<JsonRpcReply> {
 	// Throwing or returning out of `for await` cancels the stream.
 	for await (const chunk of res.body ?? []) {
 		size += chunk.byteLength;
-		if (size > MAX_BODY_BYTES) throw tooBig();
+		if (size > maxBytes) throw new ResponseTooLargeError(maxBytes);
 		const text = decoder.decode(chunk, { stream: true });
 		pending.push(text);
 		const window = tail + text;
@@ -162,4 +180,9 @@ function parseEvent(event: string): JsonRpcReply | undefined {
 		.map((line) => line.slice(5).trimStart())
 		.join("\n");
 	return data ? (JSON.parse(data) as JsonRpcReply) : undefined;
+}
+
+/** Cancels a body we won't read, freeing its connection. Never throws. */
+async function discard(res: Response): Promise<void> {
+	await res.body?.cancel().catch(() => undefined);
 }

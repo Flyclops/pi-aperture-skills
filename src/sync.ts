@@ -8,7 +8,7 @@
  */
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
-import { openSession } from "./mcp-client.ts";
+import { MAX_BODY_BYTES, openSession, ResponseTooLargeError } from "./mcp-client.ts";
 
 export interface SyncOptions {
 	/** Aperture's MCP endpoint. */
@@ -52,21 +52,7 @@ export async function syncSkills(opts: SyncOptions): Promise<SyncResult> {
 	const session = await openSession(opts.url, opts.signal);
 	try {
 		const plans = claimDirs((await listAllSkills(session.request)).map((s) => planSkill(s, opts.cacheDir)));
-		// One limit across every file of every skill, so a skill with
-		// thousands of resources can't fire thousands of requests at once.
-		const limited = limiter(opts.concurrency ?? 8);
-		const total = opts.maxTotalBytes ?? MAX_TOTAL_BYTES;
-		let left = total;
-		// The whole read, budget check to budget update, runs inside one
-		// slot, so nothing is downloaded after the budget runs out.
-		const readFile = (uri: string) =>
-			limited(async () => {
-				if (left <= 0) throw overBudget(total);
-				const data = decodeContents(await session.request<ReadResult>("resources/read", { uri }), uri);
-				left -= data.byteLength;
-				if (left < 0) throw overBudget(total);
-				return data;
-			});
+		const readFile = budgetedReader(session.request, opts.concurrency ?? 8, opts.maxTotalBytes ?? MAX_TOTAL_BYTES);
 		const outcomes = await Promise.all(
 			plans.map((plan) => ("reason" in plan ? plan : fetchSkill(plan, readFile, opts.signal))),
 		);
@@ -98,9 +84,68 @@ function decodeContents(res: ReadResult, uri: string): Buffer {
 	throw new Error(`resources/read returned no content for ${uri}`);
 }
 
+/**
+ * Returns a `resources/read` function that runs at most `concurrency` reads
+ * at once (one limit across every file of every skill) and downloads at most
+ * `total` bytes of file data overall.
+ *
+ * Each read reserves budget before it starts and its response is capped at
+ * that reservation, so parallel reads can never overshoot; what the file
+ * doesn't use goes back once it arrives. A read only takes less than a full
+ * `MAX_BODY_BYTES` reservation when no other read is in flight, so a cap
+ * reflects the real remaining budget rather than other reads' unused
+ * reservations. Once a file fails for lack of budget, every later read fails
+ * without a request.
+ */
+export function budgetedReader(
+	request: Request,
+	concurrency: number,
+	total: number,
+): (uri: string) => Promise<Buffer> {
+	const limited = limiter(concurrency);
+	let left = total;
+	let spent = false;
+	let inFlight = 0;
+	let waiting: (() => void)[] = [];
+	return (uri) =>
+		limited(async () => {
+			// Wait for in-flight reads to return their unused reservations.
+			while (!spent && left < MAX_BODY_BYTES && inFlight > 0) {
+				await new Promise<void>((r) => waiting.push(r));
+			}
+			const reserved = Math.min(MAX_BODY_BYTES, left);
+			if (spent || reserved <= 0) throw overBudget(total);
+			left -= reserved;
+			inFlight++;
+			let used = 0;
+			try {
+				const data = decodeContents(await request<ReadResult>("resources/read", { uri }, reserved), uri);
+				// Decoding can grow the data (each invalid UTF-8 byte becomes a
+				// 3-byte U+FFFD), so the cap on the response isn't enough.
+				if (data.byteLength > reserved) throw new ResponseTooLargeError(reserved);
+				used = data.byteLength;
+				return data;
+			} catch (err) {
+				// Hitting a cap smaller than the per-response limit means the
+				// budget, not the file, ran out.
+				if (err instanceof ResponseTooLargeError && reserved < MAX_BODY_BYTES) {
+					spent = true;
+					throw overBudget(total);
+				}
+				throw err;
+			} finally {
+				left += reserved - used;
+				inFlight--;
+				const wake = waiting;
+				waiting = [];
+				for (const w of wake) w();
+			}
+		});
+}
+
 const overBudget = (total: number) => new Error(`skills exceed the ${total}-byte download budget`);
 
-type Request = <T>(method: string, params?: object) => Promise<T>;
+type Request = <T>(method: string, params?: object, maxBytes?: number) => Promise<T>;
 
 async function listAllSkills(request: Request): Promise<unknown[]> {
 	const all: unknown[] = [];
@@ -148,9 +193,15 @@ function planSkill(raw: unknown, cacheDir: string): Plan | Skipped {
 	// SKILL.md always comes first, whether or not `resources` lists it.
 	const uris = [...new Set([skill.uri, ...resources.map((r) => r?.uri)])];
 	const files: Plan["files"] = [];
+	// Distinct URIs (`SKILL.md` vs `%53KILL.md`, or names differing in case)
+	// can land on one file; refuse rather than let one silently replace another.
+	const seen = new Set<string>();
 	for (const uri of uris) {
 		const path = typeof uri === "string" ? cachePathFor(uri, cacheDir) : undefined;
 		if (!path || !path.startsWith(dir + sep)) return skip(`unsafe file URI ${JSON.stringify(uri)}`);
+		const key = claimKey(path);
+		if (seen.has(key)) return skip(`two files map to ${JSON.stringify(relative(dir, path))}`);
+		seen.add(key);
 		files.push({ uri: uri as string, path });
 	}
 	const group = relative(cacheDir, dir).split(sep)[0]!;
@@ -184,7 +235,7 @@ function claimDirs(plans: (Plan | Skipped)[]): (Plan | Skipped)[] {
 	return plans.map((p) => ("dir" in p && clash.has(p) ? { name: p.name, reason: "overlaps another skill's directory" } : p));
 }
 
-/** A directory's identity on a case- and normalization-insensitive filesystem. */
+/** A path's identity on a case- and normalization-insensitive filesystem. */
 function claimKey(dir: string): string {
 	const folded = dir
 		.split(sep)

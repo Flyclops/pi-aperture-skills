@@ -43,6 +43,12 @@ export interface FakeOptions {
 	readDelayMs?: Record<string, number>;
 	/** Send each SSE response in pieces of this many bytes. */
 	chunkBytes?: number;
+	/**
+	 * URIs whose `resources/read` starts an endless body: `"error"` with HTTP
+	 * 500, `"huge"` with a Content-Length over the client's limit. When the
+	 * client hangs up, `cancelled <uri>` is recorded in `calls`.
+	 */
+	endlessReads?: Record<string, "error" | "huge">;
 	/** Leave each skill's SKILL.md out of its listed `resources`. */
 	omitMainResource?: boolean;
 }
@@ -117,6 +123,16 @@ export async function startFakeAperture(opts: FakeOptions): Promise<FakeAperture
 			}
 			case "resources/read": {
 				const uri = msg.params.uri as string;
+				const endless = opts.endlessReads?.[uri];
+				if (endless) {
+					res.on("close", () => state.calls.push(`cancelled ${uri}`));
+					res.writeHead(endless === "error" ? 500 : 200, {
+						"content-type": "text/event-stream",
+						...(endless === "huge" ? { "content-length": String(1e9) } : {}),
+					});
+					res.write(": still going\n");
+					return;
+				}
 				const wait = opts.readDelayMs?.[uri];
 				if (wait) {
 					await new Promise((r) => setTimeout(r, wait));

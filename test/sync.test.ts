@@ -3,8 +3,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { tempDir } from "./temp.ts";
-import { MAX_BODY_BYTES } from "../src/mcp-client.ts";
-import { syncSkills } from "../src/sync.ts";
+import { MAX_BODY_BYTES, ResponseTooLargeError } from "../src/mcp-client.ts";
+import { budgetedReader, syncSkills } from "../src/sync.ts";
 import { type FakeSkill, skill, startFakeAperture } from "./fake-aperture.ts";
 
 function freshDir(): string {
@@ -368,4 +368,82 @@ test("stops downloading once the budget is spent", async (t) => {
 
 	// SKILL.md, f0 and f1 use up 1000 bytes; nothing after that is fetched.
 	assert.equal(fake.calls.filter((c) => c === "resources/read").length, 3);
+});
+
+test("parallel reads never download more than the budget", async () => {
+	let downloaded = 0;
+	// Honours the cap the way the real client does: refuses a bigger body.
+	const request = async <T>(_m: string, _p?: object, maxBytes = MAX_BODY_BYTES): Promise<T> => {
+		await new Promise((r) => setTimeout(r, 5));
+		if (600 > maxBytes) throw new ResponseTooLargeError(maxBytes);
+		downloaded += 600;
+		return { contents: [{ text: "x".repeat(600) }] } as T;
+	};
+	const read = budgetedReader(request, 8, 1000);
+
+	const results = await Promise.allSettled(Array.from({ length: 8 }, (_, i) => read(`skill://g/s/f${i}`)));
+
+	assert.ok(downloaded <= 1000, `downloaded ${downloaded} bytes`);
+	assert.equal(results.filter((r) => r.status === "fulfilled").length, 1);
+});
+
+test("skips a skill whose distinct URIs land on the same file", async (t) => {
+	const twins = skill("personal", "twins", { "Notes.md": "a", "notes.md": "b" });
+	const encoded = skill("personal", "encoded", { "%53KILL.md": "replaced" });
+	const fake = await startFakeAperture({ skills: [twins, encoded, skill("personal", "ok")] });
+	t.after(() => fake.close());
+
+	const result = await syncSkills({ url: fake.url, cacheDir: freshDir() });
+
+	assert.deepEqual(result.loaded, ["ok"]);
+	assert.deepEqual(
+		result.skipped.map((s) => s.reason),
+		['two files map to "notes.md"', 'two files map to "SKILL.md"'],
+	);
+});
+
+test("hangs up on error and oversized bodies instead of leaving them open", async (t) => {
+	const a = skill("personal", "a");
+	const b = skill("personal", "b");
+	const fake = await startFakeAperture({
+		skills: [a, b, skill("personal", "ok")],
+		endlessReads: { [a.uri]: "error", [b.uri]: "huge" },
+	});
+	t.after(() => fake.close());
+
+	const result = await syncSkills({ url: fake.url, cacheDir: freshDir() });
+	await new Promise((r) => setTimeout(r, 100)); // let the close events land
+
+	assert.deepEqual(result.loaded, ["ok"]);
+	assert.ok(fake.calls.includes(`cancelled ${a.uri}`), "error body cancelled");
+	assert.ok(fake.calls.includes(`cancelled ${b.uri}`), "oversized body cancelled");
+});
+
+test("small reads in flight don't make a mid-size read look over budget", async () => {
+	const MB = 1024 * 1024;
+	// Seven slow 1 KB reads each hold a full reservation while a 3 MB read
+	// asks for budget; 31 MB of 100 MB is nowhere near the limit.
+	const request = async <T>(_m: string, params?: object, maxBytes = MAX_BODY_BYTES): Promise<T> => {
+		const size = (params as { uri: string }).uri.endsWith("big") ? 3 * MB : 1024;
+		await new Promise((r) => setTimeout(r, size === 1024 ? 30 : 5));
+		if (size > maxBytes) throw new ResponseTooLargeError(maxBytes);
+		return { contents: [{ blob: Buffer.alloc(size).toString("base64") }] } as T;
+	};
+	const read = budgetedReader(request, 8, 100 * MB);
+	for (let i = 0; i < 10; i++) await read("skill://g/s/prefill-big"); // 30 MB used
+
+	const results = await Promise.allSettled([
+		...Array.from({ length: 7 }, (_, i) => read(`skill://g/s/small${i}`)),
+		read("skill://g/s/big"),
+	]);
+
+	assert.deepEqual(results.map((r) => r.status), Array(8).fill("fulfilled"));
+});
+
+test("counts decoded bytes, not received bytes, against the budget", async () => {
+	// 600 invalid UTF-8 bytes decode to 600 U+FFFD, 1800 bytes on disk.
+	const request = async <T>(): Promise<T> => ({ contents: [{ text: "\uFFFD".repeat(600) }] }) as T;
+	const read = budgetedReader(request, 1, 1000);
+
+	await assert.rejects(read("skill://g/s/f"), /1000-byte download budget/);
 });
