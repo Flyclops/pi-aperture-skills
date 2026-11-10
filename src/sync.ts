@@ -8,7 +8,7 @@
  */
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
-import { MAX_BODY_BYTES, openSession, ResponseTooLargeError } from "./mcp-client.ts";
+import { MAX_BODY_BYTES, openSession } from "./mcp-client.ts";
 
 export interface SyncOptions {
 	/** Aperture's MCP endpoint. */
@@ -86,16 +86,17 @@ function decodeContents(res: ReadResult, uri: string): Buffer {
 
 /**
  * Returns a `resources/read` function that runs at most `concurrency` reads
- * at once (one limit across every file of every skill) and downloads at most
- * `total` bytes of file data overall.
+ * at once (one limit across every file of every skill) and keeps at most
+ * `total` bytes of decoded file data overall.
  *
- * Each read reserves budget before it starts and its response is capped at
- * that reservation, so parallel reads can never overshoot; what the file
- * doesn't use goes back once it arrives. A read only takes less than a full
- * `MAX_BODY_BYTES` reservation when no other read is in flight, so a cap
- * reflects the real remaining budget rather than other reads' unused
- * reservations. Once a file fails for lack of budget, every later read fails
- * without a request.
+ * The budget counts decoded bytes, the ones held in memory and written to
+ * disk; the wire format (base64, JSON escaping) is the client's
+ * `MAX_BODY_BYTES` cap's concern. Each read reserves budget before it starts
+ * and gives back what its file doesn't use, so parallel reads can never
+ * overshoot. A read only takes less than a full `MAX_BODY_BYTES` reservation
+ * when no other read is in flight, so a shortfall reflects the real remaining
+ * budget rather than other reads' unused reservations. Once a file doesn't
+ * fit, every later read fails without a request.
  */
 export function budgetedReader(
 	request: Request,
@@ -119,20 +120,19 @@ export function budgetedReader(
 			inFlight++;
 			let used = 0;
 			try {
-				const data = decodeContents(await request<ReadResult>("resources/read", { uri }, reserved), uri);
-				// Decoding can grow the data (each invalid UTF-8 byte becomes a
-				// 3-byte U+FFFD), so the cap on the response isn't enough.
-				if (data.byteLength > reserved) throw new ResponseTooLargeError(reserved);
+				const data = decodeContents(await request<ReadResult>("resources/read", { uri }), uri);
+				if (data.byteLength > reserved) {
+					// Short of a full reservation, the budget ran out. With one,
+					// the file decoded past the per-file limit (each invalid
+					// UTF-8 byte becomes a 3-byte U+FFFD).
+					if (reserved < MAX_BODY_BYTES) {
+						spent = true;
+						throw overBudget(total);
+					}
+					throw new Error(`${uri} decodes to over ${MAX_BODY_BYTES} bytes`);
+				}
 				used = data.byteLength;
 				return data;
-			} catch (err) {
-				// Hitting a cap smaller than the per-response limit means the
-				// budget, not the file, ran out.
-				if (err instanceof ResponseTooLargeError && reserved < MAX_BODY_BYTES) {
-					spent = true;
-					throw overBudget(total);
-				}
-				throw err;
 			} finally {
 				left += reserved - used;
 				inFlight--;
@@ -145,7 +145,7 @@ export function budgetedReader(
 
 const overBudget = (total: number) => new Error(`skills exceed the ${total}-byte download budget`);
 
-type Request = <T>(method: string, params?: object, maxBytes?: number) => Promise<T>;
+type Request = <T>(method: string, params?: object) => Promise<T>;
 
 async function listAllSkills(request: Request): Promise<unknown[]> {
 	const all: unknown[] = [];

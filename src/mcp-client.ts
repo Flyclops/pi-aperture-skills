@@ -21,7 +21,7 @@ export class McpError extends Error {
 }
 
 /** A response body was bigger than the caller allowed. */
-export class ResponseTooLargeError extends Error {
+class ResponseTooLargeError extends Error {
 	readonly limit: number;
 
 	constructor(limit: number) {
@@ -32,11 +32,8 @@ export class ResponseTooLargeError extends Error {
 }
 
 export interface McpSession {
-	/**
-	 * Sends a request and resolves with its `result`. The response body may
-	 * be at most `maxBytes` (default and ceiling: `MAX_BODY_BYTES`).
-	 */
-	request<T>(method: string, params?: object, maxBytes?: number): Promise<T>;
+	/** Sends a request and resolves with its `result`. */
+	request<T>(method: string, params?: object): Promise<T>;
 	/** Ends the session. Best effort: the server expires idle sessions anyway. */
 	close(): Promise<void>;
 }
@@ -88,12 +85,12 @@ export async function openSession(url: string, signal?: AbortSignal): Promise<Mc
 		return res;
 	};
 
-	const request = async <T>(method: string, params: object = {}, maxBytes = MAX_BODY_BYTES): Promise<T> => {
+	const request = async <T>(method: string, params: object = {}): Promise<T> => {
 		const id = nextId++;
 		const res = await post({ jsonrpc: "2.0", id, method, params });
 		const sid = res.headers.get("mcp-session-id");
 		if (sid) sessionId = sid;
-		const reply = await readReply(res, id, Math.min(maxBytes, MAX_BODY_BYTES));
+		const reply = await readReply(res, id);
 		if (reply.error) throw new McpError(method, reply.error.code, reply.error.message);
 		return reply.result as T;
 	};
@@ -130,14 +127,14 @@ interface JsonRpcReply {
 
 /**
  * Reads the reply to request `id` from a JSON or SSE response body, never
- * buffering more than `maxBytes`. SSE events are parsed as they arrive
+ * buffering more than `MAX_BODY_BYTES`. SSE events are parsed as they arrive
  * and reading stops at the matching reply, so a server that keeps the stream
  * open after answering doesn't stall us.
  */
-async function readReply(res: Response, id: number, maxBytes: number): Promise<JsonRpcReply> {
-	if (Number(res.headers.get("content-length") ?? 0) > maxBytes) {
+async function readReply(res: Response, id: number): Promise<JsonRpcReply> {
+	if (Number(res.headers.get("content-length") ?? 0) > MAX_BODY_BYTES) {
 		await discard(res);
-		throw new ResponseTooLargeError(maxBytes);
+		throw new ResponseTooLargeError(MAX_BODY_BYTES);
 	}
 	const sse = (res.headers.get("content-type") ?? "").includes("text/event-stream");
 	const decoder = new TextDecoder();
@@ -152,7 +149,7 @@ async function readReply(res: Response, id: number, maxBytes: number): Promise<J
 	// Throwing or returning out of `for await` cancels the stream.
 	for await (const chunk of res.body ?? []) {
 		size += chunk.byteLength;
-		if (size > maxBytes) throw new ResponseTooLargeError(maxBytes);
+		if (size > MAX_BODY_BYTES) throw new ResponseTooLargeError(MAX_BODY_BYTES);
 		const text = decoder.decode(chunk, { stream: true });
 		pending.push(text);
 		const window = tail + text;

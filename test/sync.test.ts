@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { tempDir } from "./temp.ts";
-import { MAX_BODY_BYTES, ResponseTooLargeError } from "../src/mcp-client.ts";
+import { MAX_BODY_BYTES } from "../src/mcp-client.ts";
 import { budgetedReader, syncSkills } from "../src/sync.ts";
 import { type FakeSkill, skill, startFakeAperture } from "./fake-aperture.ts";
 
@@ -370,21 +370,29 @@ test("stops downloading once the budget is spent", async (t) => {
 	assert.equal(fake.calls.filter((c) => c === "resources/read").length, 3);
 });
 
-test("parallel reads never download more than the budget", async () => {
-	let downloaded = 0;
-	// Honours the cap the way the real client does: refuses a bigger body.
-	const request = async <T>(_m: string, _p?: object, maxBytes = MAX_BODY_BYTES): Promise<T> => {
+test("parallel reads never keep more than the budget", async () => {
+	let requests = 0;
+	const request = async <T>(): Promise<T> => {
+		requests++;
 		await new Promise((r) => setTimeout(r, 5));
-		if (600 > maxBytes) throw new ResponseTooLargeError(maxBytes);
-		downloaded += 600;
 		return { contents: [{ text: "x".repeat(600) }] } as T;
 	};
 	const read = budgetedReader(request, 8, 1000);
 
 	const results = await Promise.allSettled(Array.from({ length: 8 }, (_, i) => read(`skill://g/s/f${i}`)));
 
-	assert.ok(downloaded <= 1000, `downloaded ${downloaded} bytes`);
-	assert.equal(results.filter((r) => r.status === "fulfilled").length, 1);
+	const kept = results.filter((r) => r.status === "fulfilled");
+	assert.equal(kept.length, 1, "600 + 600 > 1000, so only one fits");
+	assert.equal(requests, 2, "nothing is requested once the budget runs out");
+});
+
+test("budgets decoded bytes, so base64 overhead doesn't count", async () => {
+	const MB = 1024 * 1024;
+	// 4 MB of binary arrives as ~5.3 MB of base64; 5 MB of budget is enough.
+	const request = async <T>(): Promise<T> => ({ contents: [{ blob: Buffer.alloc(4 * MB).toString("base64") }] }) as T;
+	const read = budgetedReader(request, 8, 5 * MB);
+
+	assert.equal((await read("skill://g/s/bin")).byteLength, 4 * MB);
 });
 
 test("skips a skill whose distinct URIs land on the same file", async (t) => {
@@ -423,10 +431,9 @@ test("small reads in flight don't make a mid-size read look over budget", async 
 	const MB = 1024 * 1024;
 	// Seven slow 1 KB reads each hold a full reservation while a 3 MB read
 	// asks for budget; 31 MB of 100 MB is nowhere near the limit.
-	const request = async <T>(_m: string, params?: object, maxBytes = MAX_BODY_BYTES): Promise<T> => {
+	const request = async <T>(_m: string, params?: object): Promise<T> => {
 		const size = (params as { uri: string }).uri.endsWith("big") ? 3 * MB : 1024;
 		await new Promise((r) => setTimeout(r, size === 1024 ? 30 : 5));
-		if (size > maxBytes) throw new ResponseTooLargeError(maxBytes);
 		return { contents: [{ blob: Buffer.alloc(size).toString("base64") }] } as T;
 	};
 	const read = budgetedReader(request, 8, 100 * MB);
