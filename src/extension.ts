@@ -8,7 +8,7 @@
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createCacheDir, DEFAULT_ROOT, removeCacheDir, sweepStaleCacheDirs } from "./cache-dir.ts";
-import { readApertureUrl } from "./config.ts";
+import { findApertureUrl } from "./config.ts";
 import { displayUrl } from "./mcp-client.ts";
 import { type SyncResult, syncSkills } from "./sync.ts";
 
@@ -37,9 +37,13 @@ export function registerApertureSkills(pi: ExtensionAPI, opts: Options): void {
 		};
 		dropCache();
 
-		const lookup = readApertureUrl(opts.mcpJsonPath);
+		// Servers other extensions registered are all in place by now: pi awaits
+		// every extension factory before `resources_discover`. Don't handle
+		// `mcp_servers_change` to catch later ones; that makes this extension
+		// responsible for connecting registered servers. `/reload` picks them up.
+		const lookup = findApertureUrl(opts.mcpJsonPath, pi.getMcpServers());
 		if ("problem" in lookup) {
-			notify(`Aperture skills not loaded: ${lookup.problem}`, "warning");
+			notify(`Aperture skills not loaded: ${clean(lookup.problem, 400)}`, "warning");
 			return;
 		}
 
