@@ -17,6 +17,9 @@ import type { RegisteredMcpServer } from "@earendil-works/pi-coding-agent";
 /** The server name this extension looks for. */
 export const SERVER_NAME = "aperture";
 
+/** The `type` values pi accepts for an `mcpServers` entry. */
+const TRANSPORT_TYPES = new Set(["stdio", "http", "streamable-http"]);
+
 /** Either the URL, or a user-facing explanation of why there is none. */
 export type UrlLookup = { url: string } | { problem: string };
 
@@ -77,13 +80,25 @@ export function readApertureUrl(mcpJsonPath: string): UrlLookup | Absent {
 		const foundText = found.length ? ` (found: ${found.join(", ")})` : "";
 		return { absent: `no "${SERVER_NAME}" server in ${mcpJsonPath}${foundText}` };
 	}
-	// Pi skips user-level entries it can't validate (SSE, no transport, a
-	// non-HTTP(S) url), so a registered server stays in charge.
-	if (server.type === "sse") {
-		return { absent: `the "${SERVER_NAME}" entry in ${mcpJsonPath} uses unsupported SSE` };
+	// Pi skips user-level entries it can't validate (unknown type such as SSE,
+	// non-boolean `enabled`, no transport, a non-HTTP(S) url), so a registered
+	// server stays in charge. Pi doesn't export its validator; these are the
+	// checks that decide which URL we'd use.
+	if (server.type !== undefined && !TRANSPORT_TYPES.has(server.type as string)) {
+		return {
+			absent: `the "${SERVER_NAME}" entry in ${mcpJsonPath} has unsupported type ${JSON.stringify(server.type)}`,
+		};
+	}
+	if (server.enabled !== undefined && typeof server.enabled !== "boolean") {
+		return { absent: `the "${SERVER_NAME}" entry in ${mcpJsonPath} has a non-boolean "enabled"` };
+	}
+	// Pi never treats a `type: "stdio"` entry's url as HTTP; without a command it skips it.
+	if (server.type === "stdio" && server.command === undefined) {
+		return { absent: `the "${SERVER_NAME}" entry in ${mcpJsonPath} is stdio with no "command"` };
 	}
 	// A stdio server is one pi would run instead of any registered server.
-	if (server.command !== undefined && server.url === undefined) {
+	const isStdio = server.type === "stdio" || (server.command !== undefined && server.url === undefined);
+	if (isStdio) {
 		return {
 			problem:
 				`the "${SERVER_NAME}" server in ${mcpJsonPath} has no "url"; ` +
@@ -109,7 +124,8 @@ function registeredUrl({ config, extensionPath }: RegisteredMcpServer): UrlLooku
 	if (!("url" in config) || typeof config.url !== "string" || config.url === "") {
 		return { problem: `${where} has no "url"; this extension needs Aperture's HTTP MCP endpoint` };
 	}
-	if (config.headers || config.auth || config.oauth) {
+	const hasHeaders = Object.keys(config.headers ?? {}).length > 0;
+	if (hasHeaders || config.auth || config.oauth) {
 		return {
 			problem:
 				`${where} uses headers, provider auth or OAuth, which this extension can't send. ` +

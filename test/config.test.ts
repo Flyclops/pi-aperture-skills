@@ -63,8 +63,13 @@ test("explains a missing aperture server and lists the servers found", () => {
 });
 
 test("explains an aperture stdio server", () => {
-	const path = mcpJson(JSON.stringify({ mcpServers: { aperture: { command: "aperture-mcp" } } }));
-	assert.match(problemOf(findApertureUrl(path, [])), /"aperture" server .* has no "url"/);
+	for (const entry of [
+		{ command: "aperture-mcp" },
+		{ type: "stdio", command: "aperture-mcp", url: "https://ignored/v1/mcp" },
+	]) {
+		const path = mcpJson(JSON.stringify({ mcpServers: { aperture: entry } }));
+		assert.match(problemOf(findApertureUrl(path, [providerServer])), /"aperture" server .* has no "url"/);
+	}
 });
 
 test("reports a disabled aperture server", () => {
@@ -109,6 +114,9 @@ test("falls back to a registered server past mcp.json entries pi would reject", 
 		{ url: "not a url" },
 		{ type: "http" },
 		{ type: "sse", url: "https://a/sse" },
+		{ type: "remote", url: "https://stale.example/mcp" },
+		{ url: "https://stale.example/mcp", enabled: "no" },
+		{ type: "stdio", url: "https://stale.example/mcp" },
 	]) {
 		const path = mcpJson(JSON.stringify({ mcpServers: { aperture: entry } }));
 		assert.deepEqual(findApertureUrl(path, [providerServer]), {
@@ -120,6 +128,19 @@ test("falls back to a registered server past mcp.json entries pi would reject", 
 test("never returns a non-http(s) url from mcp.json", () => {
 	const path = mcpJson(JSON.stringify({ mcpServers: { aperture: { url: "file:///etc/passwd" } } }));
 	assert.match(problemOf(findApertureUrl(path, [])), /no valid http\(s\) "url"/);
+});
+
+test("accepts every transport type pi accepts in mcp.json", () => {
+	for (const type of ["http", "streamable-http"]) {
+		const path = mcpJson(JSON.stringify({ mcpServers: { aperture: { type, url: "https://f/v1/mcp" } } }));
+		assert.deepEqual(findApertureUrl(path, [providerServer]), { url: "https://f/v1/mcp" }, type);
+	}
+});
+
+test("accepts a registered server with empty headers", () => {
+	assert.deepEqual(findApertureUrl(missing, [registered({ url: "https://a/v1/mcp", headers: {} })]), {
+		url: "https://a/v1/mcp",
+	});
 });
 
 test("ignores registered servers with other names", () => {
