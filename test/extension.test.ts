@@ -9,7 +9,7 @@ import { skill, startFakeAperture } from "./fake-aperture.ts";
 type Handler = (event: any, ctx: any) => unknown;
 
 /** A stand-in for pi: records handlers and notifications. */
-function fakePi() {
+function fakePi(mcpServers: object[] = []) {
 	const handlers = new Map<string, Handler>();
 	const notices: { message: string; level: string }[] = [];
 	const ctx = {
@@ -17,7 +17,10 @@ function fakePi() {
 		ui: { notify: (message: string, level: string) => notices.push({ message, level }) },
 	};
 	return {
-		api: { on: (event: string, h: Handler) => handlers.set(event, h) } as any,
+		api: {
+			on: (event: string, h: Handler) => handlers.set(event, h),
+			getMcpServers: () => mcpServers,
+		} as any,
 		notices,
 		emit: (event: string, payload: object = {}) => handlers.get(event)!({ type: event, ...payload }, ctx),
 	};
@@ -59,6 +62,19 @@ test("rebuilds the cache from scratch on each discovery", async (t) => {
 	await pi.emit("resources_discover", { reason: "reload" });
 
 	assert.equal(readdirSync(paths.cacheRoot).length, 1, "the previous cache dir is gone");
+});
+
+test("loads skills from an aperture server another extension registered", async (t) => {
+	const fake = await startFakeAperture({ skills: [skill("personal", "a")] });
+	t.after(() => fake.close());
+	const paths = setup(undefined);
+	const pi = fakePi([{ name: "aperture", config: { url: fake.url }, extensionPath: "/ext/p.ts" }]);
+	registerApertureSkills(pi.api, paths);
+
+	const result = (await pi.emit("resources_discover", { reason: "startup" })) as { skillPaths: string[] };
+
+	assert.equal(result.skillPaths.length, 1);
+	assert.deepEqual(pi.notices, [{ message: "Aperture: loaded 1 skill", level: "info" }]);
 });
 
 test("explains a missing aperture entry and loads nothing", async () => {

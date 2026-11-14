@@ -5,7 +5,8 @@ MCP available as ordinary `/skill:<name>` commands.
 
 On every startup and `/reload` it:
 
-1. reads Aperture's URL from the `aperture` server in `~/.pi/agent/mcp.json`;
+1. finds Aperture's URL from the `aperture` MCP server pi connects to (see
+   [Setup](#setup));
 2. calls `skills/list` and downloads every file with `resources/read`;
 3. writes them to a throwaway directory under
    `$TMPDIR/pi-aperture-skills-<uid>/`;
@@ -15,13 +16,23 @@ You get one notice per startup, e.g. `Aperture: loaded 5 skills`.
 
 ## Setup
 
-`~/.pi/agent/mcp.json` needs an `aperture` server with a `url`:
+The extension uses the same `aperture` server pi does, from either source:
 
-```json
-{
-  "mcpServers": { "aperture": { "url": "https://<your-aperture-host>/v1/mcp" } }
-}
-```
+- an `aperture` server with a `url` in `~/.pi/agent/mcp.json`:
+
+  ```json
+  {
+    "mcpServers": { "aperture": { "url": "https://<your-aperture-host>/v1/mcp" } }
+  }
+  ```
+
+- an `aperture` server another extension registers, such as the one
+  `@aliou/pi-ts-aperture` adds. `/mcp` lists it with the source `extension`.
+
+As in pi, the `mcp.json` entry wins when both exist. A registered server
+that needs `headers`, provider `auth` or `oauth` isn't supported; override
+it in `mcp.json` instead. A server registered after startup is picked up on
+the next `/reload`.
 
 Install the package:
 

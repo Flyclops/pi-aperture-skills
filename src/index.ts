@@ -1,7 +1,8 @@
 /**
  * pi-aperture-skills: makes the skills Aperture publishes over MCP available
  * as ordinary `/skill:<name>` commands. Aperture's URL comes from the
- * `aperture` server in pi's user-level `mcp.json`.
+ * `aperture` server in pi's user-level `mcp.json`, or else from an `aperture`
+ * server another extension registered.
  */
 import { join } from "node:path";
 import { type ExtensionAPI, getAgentDir } from "@earendil-works/pi-coding-agent";
