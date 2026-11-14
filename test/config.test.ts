@@ -154,8 +154,18 @@ test("reports a disabled registered server", () => {
 });
 
 test("reports a registered stdio server", () => {
-	const problem = problemOf(findApertureUrl(missing, [registered({ command: "aperture-mcp" })]));
-	assert.match(problem, /registered by \/ext\/provider\.ts has no "url"/);
+	for (const config of [
+		{ command: "aperture-mcp" },
+		{ type: "stdio", command: "aperture-mcp", url: "https://ignored.example/mcp" },
+	]) {
+		const problem = problemOf(findApertureUrl(missing, [registered(config)]));
+		assert.match(problem, /registered by \/ext\/provider\.ts has no "url"/, JSON.stringify(config));
+	}
+});
+
+test("uses the url of a registered server with a command but no type, as pi does", () => {
+	const config = { command: "aperture-mcp", url: "https://a/v1/mcp" };
+	assert.deepEqual(findApertureUrl(missing, [registered(config)]), { url: "https://a/v1/mcp" });
 });
 
 test("refuses a registered server that needs headers, provider auth or OAuth", () => {

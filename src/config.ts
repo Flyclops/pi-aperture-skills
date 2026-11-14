@@ -121,7 +121,9 @@ export function readApertureUrl(mcpJsonPath: string): UrlLookup | Absent {
 function registeredUrl({ config, extensionPath }: RegisteredMcpServer): UrlLookup {
 	const where = `the "${SERVER_NAME}" server registered by ${extensionPath}`;
 	if (config.enabled === false) return { problem: `${where} is disabled` };
-	if (!("url" in config) || typeof config.url !== "string" || config.url === "") {
+	// Pi validated the config, so `type` is absent, stdio or HTTP. A
+	// `type: "stdio"` server runs over stdio even if it also carries a url.
+	if (config.type === "stdio" || !("url" in config) || typeof config.url !== "string" || config.url === "") {
 		return { problem: `${where} has no "url"; this extension needs Aperture's HTTP MCP endpoint` };
 	}
 	const hasHeaders = Object.keys(config.headers ?? {}).length > 0;
