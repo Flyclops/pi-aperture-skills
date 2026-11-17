@@ -1,11 +1,30 @@
 {
-  "name": "pi-aperture-skills",
+  "name": "@flyclops/pi-aperture-skills",
   "version": "0.1.0",
   "description": "Load the skills Aperture publishes over MCP into pi as /skill:<name> commands.",
+  "license": "MIT",
+  "author": "Flyclops",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Flyclops/pi-aperture-skills.git"
+  },
+  "homepage": "https://github.com/Flyclops/pi-aperture-skills#readme",
+  "bugs": {
+    "url": "https://github.com/Flyclops/pi-aperture-skills/issues"
+  },
   "type": "module",
   "private": true,
   "keywords": [
     "pi-package"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
   ],
   "pi": {
     "extensions": [

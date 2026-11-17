@@ -34,11 +34,17 @@ that needs `headers`, provider `auth` or `oauth` isn't supported; override
 it in `mcp.json` instead. A server registered after startup is picked up on
 the next `/reload`.
 
-Install the package:
+Install the package from GitHub:
 
 ```bash
-pi install /path/to/pi-aperture-skills
+pi install git:github.com/Flyclops/pi-aperture-skills
+# or
+pi install https://github.com/Flyclops/pi-aperture-skills
 ```
+
+Append `@<tag-or-commit>` to pin a version, e.g.
+`git:github.com/Flyclops/pi-aperture-skills@v0.1.0`. Add `-l` to install
+it for the current project only. The package isn't published to npm.
 
 ## Behaviour
 
